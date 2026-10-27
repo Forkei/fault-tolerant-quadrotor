@@ -54,3 +54,16 @@ mlruns/
 *.pth
 *.ckpt
 *.safetensors
+
+# Phase 2 bulk data, encoder checkpoint, M3 run binaries (too large for git)
+experiments/phase2_data/
+experiments/phase2_encoder/best_checkpoint/
+experiments/*/checkpoints/
+experiments/*/clips/
+*.npz
+*.mp4
+*.gif
+
+# Small result logs that are tracked on purpose (re-include inside ignored run dirs)
+!experiments/m2_phase1_baseline/m2_phase1_baseline_1778244202/
+experiments/m2_phase1_baseline/m2_phase1_baseline_1778244202/checkpoints/

@@ -19,10 +19,12 @@ dependencies = [
     "flax>=0.8.0",
     "optax>=0.2.2",
     "distrax>=0.1.5",
+    "orbax-checkpoint>=0.5.0",
 
     # Config
     "hydra-core>=1.3.2",
     "omegaconf>=2.3.0",
+    "pyyaml>=6.0",
 
     # Logging / viz
     "wandb>=0.16.0",
@@ -36,6 +38,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Depth rendering for the M2.5/M3 obstacle environments (CUDA only)
+depth = [
+    "mujoco>=3.8.1",
+    "mujoco-warp==3.8.0.3",
+    "warp-lang==1.13.0",
+]
+# Encoder-manifold plots and M3 clip rendering
+analysis = ["scikit-learn>=1.3", "umap-learn>=0.5", "pillow>=10.0", "opencv-python>=4.8"]
 dev = ["pytest>=7.4", "black>=23.0", "pyright>=1.1"]
 
 [tool.setuptools.packages.find]

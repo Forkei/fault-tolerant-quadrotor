@@ -1,10 +1,10 @@
-# Agile quadrotor RL on consumer hardware
+# Fault-tolerant quadrotor RL in simulation
 
-I'm a CS student on a break from school. I've been working through the literature on agile quadrotor reinforcement learning — SimpleFlight, RMA, MAVEN, GRaD-Nav++ — and building toward each one on a laptop with a 4070. The end goal is something close to GRaD-Nav++: a drone that you can command in natural language, that maps its environment in 3D, and that can recover from motor failures mid-flight. Five milestones.
+A reimplementation of SimpleFlight (Chen et al., RAL 2025) on MuJoCo MJX with Crazyflie 2.1 parameters, extended with an RMA-style rotor-fault-tolerant policy and an early obstacle-avoidance policy.
 
-This is a personal project. It's also a dream I'm working toward.
+**Status: prototype. Simulation only.** Nothing here has been run on a real vehicle, and no sim-to-real claim is made. Results are single-fault-type, few-seed numbers from my own evaluation scripts, not a benchmark.
 
-Built on MuJoCo MJX + JAX. Codenamed *Iron Man Drone*.
+The Python package is named `iron_man_drone` (the project's original codename).
 
 ---
 
@@ -12,51 +12,87 @@ Built on MuJoCo MJX + JAX. Codenamed *Iron Man Drone*.
 
 | # | Goal | Status |
 |---|---|---|
-| M1 | SimpleFlight recipe on MuJoCo MJX — figure-eight tracking | **DONE** |
-| M2 | Fault tolerance via RMA two-phase training + MAVEN-style DR | Phase 1 done, Phase 2 pending eval fix |
-| M3 | Visual obstacle avoidance | Pending M2 |
-| M4 | 3DGS-SLAM mapping + landmark return | Pending M3 |
-| M5 | GRaD-Nav++ — natural language flight commands | Pending M4 |
+| M1 | SimpleFlight recipe on MJX, figure-eight tracking | Done. Passes the three gated trajectories. |
+| M2 | Single-rotor fault tolerance via RMA two-phase training (privileged policy, then a causal history encoder) | Done against a loosened gate. The original spec targets were not met (see below). |
+| M2.5 | Depth rendering (MJWarp) and obstacle infrastructure | Done. Infrastructure only, no new policy. |
+| M3 | Joint fault-encoder and depth-based obstacle avoidance | Prototype. Avoids static pillars in most fair episodes; tracking precision and fault tolerance fall short of the targets. Not pursued further. |
+
+Mapping and language-commanded flight (what I'd originally listed as M4/M5) were never started and are not part of this repo.
 
 ---
 
-## M1 Results
+## M1 results
 
-SimpleFlight (Chen et al., RAL 2025) on MuJoCo MJX with the same Crazyflie 2.1 parameters and PPO hyperparameters from their Table VI. All evals use the corrected T/4 phase offset (see [Eval methodology](#eval-methodology)).
+SimpleFlight on MuJoCo MJX, with the Crazyflie 2.1 parameters and the PPO hyperparameters from the paper's Table VI. Median Euclidean distance (MED) over 1000 steps, 3 seeds, GPU MJX evaluation (`eval_suite.py`), figure-eights started at the T/4 phase offset (see [Eval methodology](#eval-methodology)).
 
-| Trajectory | Ours (M1.3) | Paper (SimpleFlight) | Pass |
+| Trajectory | Ours | Paper | Gate |
 |---|---|---|---|
-| figure_eight_slow (T=15s) | **0.017 m** | 0.016 m | ✓ |
-| figure_eight_normal (T=5.5s) | **0.037 m** | 0.028 m | ✓ |
-| figure_eight_fast (T=3.5s) | **0.090 m** | 0.051 m | ✓ |
-| pentagram_slow | 0.054 m | 0.024 m | — |
-| polynomial (random, 3-seed) | 0.016 ± 0.002 m | 0.032 m | — |
-| zigzag (random, 3-seed) | 0.027 ± 0.001 m | 0.052 m | — |
+| figure_eight_slow (T=15 s) | 0.020 m | 0.016 m | <= 0.050 m, pass |
+| figure_eight_normal (T=5.5 s) | 0.040 m | 0.028 m | <= 0.056 m, pass |
+| figure_eight_fast (T=3.5 s) | 0.094 m | 0.051 m | <= 0.150 m, pass |
+| pentagram_slow | 0.058 m | 0.024 m | not gated |
+| polynomial (random) | 0.065 m | 0.032 m | not gated |
+| zigzag (random) | 0.043 m | 0.052 m | not gated |
 
-Thresholds from SimpleFlight Table III: figure_eight_slow ≤ 0.050 m, figure_eight_normal ≤ 0.056 m, figure_eight_fast ≤ 0.150 m. All pass. Pentagram and random-trajectory numbers are OOD diagnostics, not gated.
-
-The gap on figure_eight_fast and pentagram is real — the policy lacks rotational inertia compensation for aggressive trajectories. This is an acceptable M1 limitation; M2's task is fault tolerance, not closing that gap.
+We are 1.3x to 1.8x above the paper on the figure-eights and 2.4x above on the pentagram. The gates are my own targets, derived from the paper's Table III, not pass criteria defined by the paper. An earlier CPU-MuJoCo evaluation gave numbers about 0.003 m lower (0.017 / 0.037 / 0.090 m) and polynomial/zigzag numbers that were too low because the first waypoint was pinned to the spawn point; both effects are explained in `notes/M1_3_results.md`.
 
 ---
 
-## M2 Results (Phase 1 — in progress)
+## M2 results: RMA fault tolerance
 
-M2 extends M1.3 with RMA two-phase training: Phase 1 trains a privileged policy that observes the physical perturbation vector directly; Phase 2 (pending) trains a causal encoder to predict it from observable history.
+Phase 1 trains an actor that is given the privileged perturbation vector e_t = [eta_1..eta_4, mass scale, F_x, F_y, F_z]. Phase 2 freezes that actor and trains a causal encoder phi(history) -> e_t from observable history, then deploys the actor with the encoder's estimate in place of the ground truth.
 
-**Domain randomization active in Phase 1 training:** one-rotor efficiency fault (η ∈ [0.5, 1.0], probability 0.70 per episode), mass variation ±20%, k_f ±30%.
+**Randomization during Phase 1:** one rotor at efficiency eta ~ U(0.5, 1.0) with probability 0.7 per episode (otherwise nominal), mass scale +/-20%, k_f +/-30%. Wind is not randomized (the F slots are always zero).
 
-All numbers use the corrected T/4 methodology (see below). Previously reported numbers (t=0 baseline) were inflated by ~0.031 m.
+**Encoder:** flat MLP, 2300 -> 256 -> 128 -> 8 with tanh, input is the last 50 steps (0.5 s) of (observation, previous action). Trained offline on 20,480 rollouts of the Phase 1 policy; best validation MSE 0.0156 (normalized), 0.0115 averaged over the four rotor channels and 0.076 for mass scale, which is the weak channel.
 
-| Condition | figure_eight_normal MED (T/4-corrected) |
-|---|---|
-| M1.3 baseline (no DR) | 0.037 m |
-| M2 no-DR ablation, epoch 7k | 0.044 m |
-| M2 + full DR, epoch 15k (extrapolated) | ~0.060 m |
-| M2 spec target | 0.037 m |
+Closed-loop evaluation, 3 seeds, MED in metres. "Fault" is rotor 0 at eta = 0.70. A `*` means at least one seed crashed.
 
-The architecture itself is not the bottleneck: M2 no-DR at 0.044 m is only 1.18× above M1.3, not the 2.5× apparent from raw inline eval numbers. The remaining gap under full DR (~0.060 m) is driven by the added difficulty of adapting to per-episode rotor faults.
+| Trajectory | Phase 1 nominal | Phase 1 fault | Phase 2 nominal | Phase 2 fault |
+|---|---|---|---|---|
+| figure_eight_slow | 0.024 | 0.032 | 0.024 | 0.034 |
+| figure_eight_normal | 0.057 | 0.079 | 0.057 | 0.081 |
+| figure_eight_fast | 0.138 | 0.534* | 0.133 | 0.605* |
+| pentagram_slow | 0.067 | 0.080 | 0.067 | 0.083 |
+| pentagram_fast | 0.079 | 0.088 | 0.079 | 0.090 |
+| polynomial | 0.088 | 0.733* | 0.087 | 0.141 |
+| zigzag | 0.053 | 0.054 | 0.053 | 0.056 |
 
-**Phase 2 is on hold** until `eval_m2_full.py` is corrected with the T/4 offset and re-run against the 15k checkpoint. The current full-eval numbers are not comparable to M1.3.
+What this does and does not show:
+
+- With the encoder in the loop, performance is within about 0.003 m of the privileged-state policy on every non-crashing condition. The history carries enough signal to identify a single degraded rotor.
+- The fault penalty on figure_eight_normal is about 1.4x. On figure_eight_fast with a fault, 2 of 3 seeds crash for both phases; this is the edge of the fault envelope at this T/W, and it is not solved.
+- The original M2 spec asked for nominal <= 0.037 m (M1 parity) and fault <= 0.060 m on figure_eight_normal. The Phase 1 policy gets 0.057 / 0.079 m. I relaxed the gate to 0.060 / 0.100 m after seeing this, so "passed" means passed against the relaxed gate. The nominal gap to M1 (0.040 m canonical) is mostly the cost of training with randomization.
+- Closed-loop evaluation covers one fault only: rotor 0 at eta = 0.70. Other rotors, eta = 0.50 and combined mass-plus-rotor faults were not evaluated, and total rotor loss is not modelled.
+- The encoder starts each episode with an all-zero history. Real-rollout analysis (`notes/M2_encoder_manifold_analysis.md`) suggests it then defaults to "no fault" for the first ~50 steps, which is the likely cause of the figure_eight_fast crashes. This was not fixed in M2.
+
+Training: 15,000 PPO epochs, 2048 envs, roughly 3.75 h on a laptop RTX 4070. Phase 2 data collection took about 3 minutes and encoder training about 1 minute.
+
+---
+
+## M3 results: obstacle avoidance (prototype)
+
+M2.5 adds an MJWarp depth camera (64x64) and a 16-slot obstacle randomizer on top of the unchanged MJX physics. M3 trains a policy from scratch with fault randomization and procedural pillar scenes at the same time, with the fault encoder trained jointly (no separate Phase 2).
+
+```
+Actor  (66-dim): [e^W (30), v (3), R (9), z_fault (8), depth bins (16)]
+Critic (72-dim): [actor obs (66), k (1), 5 nearest obstacle distances (5)]
+```
+
+The depth image is min-pooled into 16 horizontal sectors. Scenes are `forest`, `urban`, `random` and `slalom` (training) with `hallway` held out. Reward is tracking plus a proximity penalty inside 0.5 m and a terminal crash penalty at 0.15 m. Run 1 used 1024 envs and 500M environment steps (epoch 15,258). Its frozen settings are in `experiments/m3_run1/config.yaml` (`w_track = 2.0`, `w_crash = 10.0`); note that the default `W_TRACK` in `quadrotor_env_m3.py` is now 6.0, so set `W_TRACK=2` to reproduce run 1.
+
+Evaluation (`scripts/eval_m3.py`, 128 episodes per condition, greedy, 1000 steps). Episodes are bucketed by the clearance between the commanded path and the nearest obstacle. "Fair" means clearance >= 0.15 m. "Unfair" episodes command a path through the crash radius, so the policy can only survive by leaving the line.
+
+| Metric | Result | Target |
+|---|---|---|
+| Collision-free, fair episodes, nominal | 92.3% | >= 80%, met |
+| Tracking MED on collision-free episodes | 0.174 m | <= 0.10 m, **not met** |
+| Collision-free, "unfair" episodes (deviate to survive) | 16% | no target |
+| Collision-free, fair episodes, eta = 0.70 fault | 52.4% | >= 50%, marginal |
+| Loss of attitude control (out of bounds), eta = 0.70 | 38.3% | weak |
+| Figure-eight XY MED, clear air (run 1 final policy) | 0.287 m | M2 policy on the same task: 0.057 m |
+
+The policy was already at these levels at 193M steps (38% of the schedule); the remaining 307M steps bought nothing, and tracking got slightly worse. A short diagnostic sweep (`notes/M3_v2_results.md`) found the terminal crash penalty, not the tracking weight, was making the policy conservative: lowering `W_CRASH` from 10 to 4 tightened figure-eight MED from 0.287 m to 0.215 m with fair collision-free rate unchanged (91.5%), while raising `W_TRACK` had no effect. Those sweep runs were short (about 15-20M steps) and I did not continue them. The hallway holdout was not evaluated. Fault handling in M3 is clearly worse than in M2.
 
 ---
 
@@ -64,132 +100,87 @@ The architecture itself is not the bottleneck: M2 no-DR at 0.044 m is only 1.18�
 
 ### Action space
 
-CTBR — collective thrust + body rates (ω_x, ω_y, ω_z). The policy outputs a 4-dim Gaussian; a rate-PD controller with motor mixing and a first-order lag (τ = 25 ms) converts CTBR to per-rotor speeds. Direct motor command outputs were not explored; the paper uses CTBR and it matters.
+CTBR: collective thrust plus body rates (omega_x, omega_y, omega_z). The policy outputs a 4-dim Gaussian; a rate-PD controller with motor mixing and a first-order lag (tau = 25 ms) converts CTBR to per-rotor speeds.
 
 ### Observations
 
 ```
-Actor  (50-dim, M2): [e^W (30), v (3), R (9), z (8)]
-Critic (51-dim, M2): [e^W (30), v (3), R (9), e_t (8), k (1)]
+M1 actor   (42):  [e^W (30), v (3), R (9)]
+M2 actor   (50):  [e^W (30), v (3), R (9), z (8)]
+M2 critic  (51):  [e^W (30), v (3), R (9), e_t (8), k (1)]
 ```
 
-- **e^W**: relative positions to the next 10 reference waypoints in world frame, spaced 50 ms ahead (10-point lookahead × 3 dims = 30).
-- **v**: linear velocity in world frame from MuJoCo `qvel[:3]`.
-- **R**: rotation matrix body→world, flattened (9-dim). Never quaternion — empirically ~63% performance drop with quaternion on figure-eight.
-- **z (M2)**: 8-dim privileged latent. In Phase 1: z = e_t passed directly. At deployment: z = ϕ(history) from the causal encoder.
-- **e_t**: raw privileged state [η₁, η₂, η₃, η₄, m_scale, F_x, F_y, F_z]. Critic only — better value estimates with ground-truth physical params.
-- **k**: normalized episode step ∈ [0, 1]. Critic only — putting k in actor observations causes OOD failures on long flights.
+- **e^W**: relative positions to the next 10 reference waypoints in the world frame, spaced 50 ms apart.
+- **v**: world-frame linear velocity.
+- **R**: body-to-world rotation matrix, flattened. Quaternions were tried early and did much worse on the figure-eight.
+- **z**: 8-dim fault latent. In Phase 1 it is e_t from the simulator; at deployment it is the encoder output.
+- **e_t**: privileged state [eta_1..eta_4, m_scale, F_x, F_y, F_z], seen by the critic.
+- **k**: normalized episode step, critic only. Putting it in the actor caused failures on long flights.
 
-Body rates ω and previous action u_{t−1} are excluded from the actor. Both cause non-stationarity or redundancy with R.
+Body rates and the previous action are left out of the actor.
 
-### Policy network
+### Networks and PPO
 
-3-layer MLP, 256 hidden units, ELU activations + LayerNorm after each layer. Asymmetric: actor and critic are separate Flax modules with separate Optax optimizers.
+Actor and critic are separate Flax MLPs (3 x 256, ELU, LayerNorm) with separate Optax optimizers. PPO hyperparameters follow SimpleFlight Table VI unchanged: gamma 0.99, lambda 0.95, clip 0.2, actor LR 3e-4, critic LR 1e-4, 16 critic updates per actor update, entropy coefficient 1e-3, horizon 32, 8 minibatches, 5 epochs, 2048 envs (1024 for M3).
 
-```
-Actor:  50 → 256 → 256 → 256 → 4   (CTBR mean + log_std)
-Critic: 51 → 256 → 256 → 256 → 1   (scalar value)
-```
+Rollout is a single `jax.lax.scan`, environments are batched with `jax.vmap` over a shared `mjx.Model`. Throughput is about 70k steps/s on a laptop RTX 4070 for M1/M2 and roughly 20-30k steps/s with depth rendering for M3.
 
-### PPO hyperparameters
+### Trajectories
 
-From SimpleFlight Table VI, unchanged:
+Trajectories are lazy (coefficients stored, positions evaluated on demand); precomputing per-env position arrays cost a 17x throughput loss under vmap.
 
-| Parameter | Value |
-|---|---|
-| γ (discount) | 0.99 |
-| λ (GAE) | 0.95 |
-| Clip ε | 0.20 |
-| Actor LR | 3e-4 |
-| Critic LR | 1e-4 (separate, lower) |
-| Critic updates per actor update | 16 |
-| Entropy coefficient | 1e-3 |
-| Horizon | 32 steps/env |
-| Minibatches | 8 |
-| PPO epochs | 5 |
-| Envs | 2048 |
+Training mixes C2-continuous piecewise quintic polynomials with random zigzags. Evaluation trajectories (figure-eight at three speeds, pentagram at two) are never seen in training. An earlier polynomial generator produced zero-curvature segments and the policy could not turn the figure-eight apex; see L3 below.
 
-16 critic updates per actor update is unusual but follows the paper. Entropy coefficient of 1e-3 keeps entropy below 10% of reward at initialization — a hard requirement; higher values prevent convergence.
+### Domain randomization
 
-### Training infrastructure
-
-Rollout is a single `jax.lax.scan` over (state, action) — fully JIT-compiled, no Python loop overhead. GAE computed in a second reverse scan. 2048 environments via `jax.vmap` over a shared `mjx.Model`. Throughput: ~70k steps/sec on an RTX 4070. 15k epochs at horizon=32 take approximately 3.75 hours.
-
-### Trajectory system
-
-**Lazy design**: trajectories store coefficients and evaluate positions on demand. Precomputing a 1000-step position array per env at reset caused a 17× throughput loss from the vmap cost — abandoned.
-
-**Training distribution** (50/50 per episode):
-- C2-continuous quintic polynomial: random 5th-degree polynomial per segment, with nonzero interior velocities/accelerations (C2 continuity). Early attempts used a scalar h(τ) applied to straight-line segments, producing κ=0 everywhere — the drone learned to stop-and-pivot rather than curve, causing persistent failures on figure-eight apices.
-- Random zigzag: waypoints in [−1,1]², connected by straight segments. Intentionally infeasible (waypoint corners require infinite acceleration). Included for OOD generalization.
-
-**Eval trajectories** (held-out, never seen during training):
-- Figure-eight: analytic Lemniscate at three speeds (slow/normal/fast).
-- Pentagram: star-pentagon at two speeds, traversed in star-skipping order.
-
-### Domain randomization (M2)
-
-Sampled at episode reset, constant within episode, stored in `EnvState`:
-
-- **Rotor efficiency** η_i: with p=0.70, one rotor is faulted at η_j ~ U(0.50, 1.00); others at 1.0. With p=0.30, all nominal. At η=0.50, total thrust is 87.5% of nominal → T/W ≈ 1.57, still controllable.
-- **Mass scale**: m_scale ~ U(0.80, 1.20), applied as extra external force.
-- **Thrust coefficient**: k_f ± 30% (carried from M1).
-- **Wind**: excluded from Phase 1 training; OOD-only in Phase 2 eval.
-
-Applied via: `effective_speeds = rotor_speeds × sqrt(kf_mult × η_i)`.
+Sampled at reset, constant within the episode. Rotor efficiency (one rotor, p = 0.7, eta ~ U(0.5, 1.0)), mass scale U(0.8, 1.2) applied as an extra force, thrust coefficient k_f +/-30%. Applied as `effective_speeds = rotor_speeds * sqrt(kf_mult * eta_i)`. At eta = 0.5 total thrust is 87.5% of nominal (T/W about 1.57).
 
 ---
 
 ## Eval methodology
 
-SimpleFlight evaluates figure-eight trajectories by initializing the reference at t = T/4, not t = 0. At T/4, the Lemniscate evaluates to (0, 0, 1) — exactly where the drone spawns — so initial XY error is zero. This is not stated in the paper; it is code-only behavior in `omni_drones/envs/single/track.py`:
+SimpleFlight starts figure-eight references at t = T/4, where the lemniscate passes through (0, 0, 1), the drone's spawn point. This is not stated in the paper; it is in the authors' code (`omni_drones/envs/single/track.py`, `traj_t0 = 5.5 / 4`). Starting at t = 0 puts the reference 1 m away and adds about 0.03-0.04 m to the mean error. All numbers in this README use the T/4 offset and crash-only termination (height < 0.05 m, horizontal or vertical deviation > 5 m, tilt > 60 degrees).
 
-```python
-self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 5.5 / 4
-```
-
-At t = 0, the reference is at (1, 0, 1) while the drone is at (0, 0, 1): 1 m initial error. The policy acquires the trajectory within ~100 steps, but the mean over 1000 steps includes this acquisition phase, inflating MED by ~0.031 m. All M1.3 results use the corrected T/4 offset. M2 inline training evals do not yet have this fix (documented; required before Phase 2 go/no-go).
+Training-time inline evals in `train_m2.py` do not use the offset and should not be compared with the tables above. Evaluate with `scripts/eval_m1_suite.py`, `scripts/eval_m2_full.py` and `scripts/eval_m2_phase2.py`.
 
 ---
 
 ## Lessons from failed attempts
 
-**L1 — I paused a training run and lost two weeks of progress.** Restoring params while reinitializing Adam momentum caused a jump from 0.085 m to 0.215 m MED immediately post-resume, followed by 11,000 epochs of unrecoverable crash-at-step-8 behavior. The policy entered a feedback loop where short rollouts (crash at step 8) provided gradient signal only for the initial observation, reinforcing the crash. Run uninterrupted; if forced to resume, restore full optimizer state including Adam μ, ν, and step count.
+**L1: Resuming from a checkpoint without optimizer state wrecked a run.** Restoring params but reinitializing Adam moved MED from 0.085 m to 0.215 m immediately, followed by 11,000 epochs of crash-at-step-8 behaviour. Restore full optimizer state or don't resume.
 
-**L2 — I spent three weeks confused about why a "working" policy kept failing on figure-eight.** Training on 2048 random trajectories allows high mean reward even when the held-out figure-eight eval fails completely. A policy crashing on every figure-eight episode can maintain training reward of 1.33 because randomly-initialized polynomial episodes provide positive signal. Use held-out MED as the primary convergence signal.
+**L2: Training reward hid a total failure on the held-out trajectory.** With 2048 random trajectories, mean reward can stay high while the figure-eight eval crashes every time. Use held-out MED as the convergence signal.
 
-**L3 — The polynomial generator was wrong for a month before I noticed. It produced straight-line segments with a smooth speed profile — κ=0 everywhere. The figure-eight apex needs κ=4.8 m⁻¹. The drone wasn't undertrained; it was a perfect student of the wrong curriculum.** With 0% curvature coverage in training, the policy plateaued at 0.105 m on figure-eight. Replacing with C2-continuous piecewise quintic polynomials (random nonzero interior velocities) immediately dropped MED to 0.085 m in 2000 epochs.
+**L3: The polynomial generator was wrong for a month.** It produced straight segments with a smooth speed profile (curvature 0 everywhere), while the figure-eight apex needs about 4.8 1/m. The policy was fine on its curriculum and the curriculum was wrong. C2 piecewise quintics dropped MED from 0.105 m to 0.085 m in 2000 epochs.
+
+Later entries (encoder startup, verifying numbers before reacting to them, a mis-specified regression gate in M3) are in `notes/lessons.md`.
 
 ---
 
-## Setup (WSL2)
+## Setup (WSL2 / Linux, NVIDIA GPU)
 
 ```bash
-# Requires WSL2 Ubuntu 22.04+ with NVIDIA GPU passthrough
-
-# 1. Environment setup (one-time)
-bash scripts/setup_env.sh
-source ~/.bashrc
-
-# 2. Activate JAX environment
-source /home/$USER/jax_env/bin/activate
-
-# 3. Verify GPU
+bash scripts/setup_env.sh                 # one-time: JAX (CUDA 12) + MuJoCo MJX
+pip install -e .                          # core dependencies
+pip install -e ".[depth]"                 # only for M2.5/M3 (MJWarp depth rendering)
 python -c "import jax; print(jax.devices())"
-# Expected: [CudaDevice(id=0)]
 
-# 4. Train M1
+# M1
 python scripts/train_m1.py
+python scripts/eval_m1_suite.py
 
-# 5. Evaluate M1
-python scripts/eval_m1_full.py \
-  --checkpoint experiments/m1_3_polynomial_fix/RUN/checkpoints/epoch_013000
-
-# 6. Train M2 Phase 1
+# M2 phase 1, then phase 2
 python scripts/train_m2.py --config experiments/m2_phase1_baseline/config.yaml --num_envs 2048
+python scripts/collect_phase2_data.py --checkpoint <phase1 run>/checkpoints/final
+python scripts/train_phase2_encoder.py
+python scripts/eval_m2_phase2.py
+
+# M3 (needs the depth extra)
+W_TRACK=2 python scripts/train_m3.py --run_name m3_run1
+python scripts/eval_m3.py --ckpt ~/m3_checkpoints/m3_run1/final --n 128
 ```
 
-**Stack:** Python 3.12, JAX with CUDA 12 (`pip install "jax[cuda12]"`), MuJoCo ≥ 3.1.6 (MJX bundled), Flax, Optax, Distrax, Orbax.
+Checkpoints and the 2.9 GB Phase 2 rollout dataset are not committed; the scripts above regenerate them. Training scripts refuse to start without a filled-in hypothesis note (`notes/M*_hypothesis.md`), a project rule. Stack: Python 3.12, JAX with CUDA 12, MuJoCo >= 3.1.6 (>= 3.8.1 with MJWarp), Flax, Optax, Distrax, Orbax.
 
 ---
 
@@ -198,32 +189,23 @@ python scripts/train_m2.py --config experiments/m2_phase1_baseline/config.yaml -
 ```
 src/iron_man_drone/
   envs/
-    crazyflie.xml             MuJoCo MJCF — Crazyflie 2.1 dynamics, forces applied programmatically
-    quadrotor_env.py          MJX env: vmap over 2048 envs, M2 DR, priv_state
-    trajectories.py           Lazy trajectory system: quintic poly, zigzag, figure-eight, pentagram
-  control/
-    ctbr_controller.py        CTBR → rotor speeds (rate PD + X-config mixer + motor lag)
+    crazyflie.xml, crazyflie_depth.xml   MJCF models (forces applied programmatically)
+    quadrotor_env.py          M1/M2 MJX env: reset/step/obs/reward, DR, privileged state
+    quadrotor_env_depth.py    M2.5: adds obstacle slots and MJWarp depth rendering
+    quadrotor_env_m3.py       M3: depth bins, history buffer, obstacle reward, scene sampling
+    trajectories.py           lazy trajectories: quintic poly, zigzag, figure-eight, pentagram
+  control/ctbr_controller.py  CTBR -> rotor speeds (rate PD, X mixer, motor lag)
   policy/
-    networks.py               Flax Actor (50→4) + Critic (51→1), 3×256 ELU+LayerNorm
-    ppo.py                    PPO trainer: lax.scan rollout, separate actor/critic TrainStates
+    networks.py               Actor and Critic
+    encoder.py                causal history encoder, e_t normalization
+    ppo.py                    PPO with lax.scan rollout, separate actor/critic states
+  evaluation/eval_suite.py    shared eval harness (T/4 offset, crash-only termination)
   utils/
-    domain_randomization.py   M2 DR parameter sampling
-experiments/
-  m1_3_polynomial_fix/        M1.3 final run (config + eval results; checkpoints gitignored)
-  m2_phase1_baseline/         M2 Phase 1 run
-notes/
-  M1_hypothesis.md            Required gating artifact before any M1 training
-  M1_3_eval_methodology.md    T/4 phase offset discovery and justification
-  M1_3_results.md             M1.3 final eval table
-  M2_spec.md                  M2 design spec (RMA architecture, DR ranges, success criteria)
-  m2_ablation_eval_clarification.md  Methodology mismatch analysis; Phase 2 decision gate
-  lessons.md                  L1–L4: failure post-mortems
-scripts/
-  train_m1.py                 M1 training entry point
-  train_m2.py                 M2 training entry point
-  eval_m1_full.py             Full M1 eval with T/4 offset (source of M1.3 0.037 m number)
-  eval_m2_full.py             Full M2 eval suite (T/4 fix pending)
-  eval_m2_methodology_check.py  M2 vs M1.3 methodology comparison script
+    domain_randomization.py   rotor/mass/k_f sampling
+    obstacle_randomization.py, scene_generator.py   pillar scenes for M2.5/M3
+experiments/                  configs, training logs, small result files (no checkpoints)
+notes/                        hypothesis docs, specs, results, lessons
+scripts/                      train_*, eval_*, diag_*, validate_*, smoke tests, benchmarks
 ```
 
 ---
@@ -233,30 +215,31 @@ scripts/
 | Parameter | Value |
 |---|---|
 | Mass | 0.0321 kg |
-| Inertia (Ixx, Iyy) | 1.4 × 10⁻⁵ kg·m² |
-| Inertia (Izz) | 2.17 × 10⁻⁵ kg·m² |
-| Thrust coefficient k_f | 2.35 × 10⁻⁸ N/(rad/s)² |
-| Torque coefficient k_m | 7.24 × 10⁻¹⁰ N·m/(rad/s)² |
-| Motor time constant τ | 25 ms |
+| Inertia (Ixx, Iyy) | 1.4e-5 kg m^2 |
+| Inertia (Izz) | 2.17e-5 kg m^2 |
+| Thrust coefficient k_f | 2.35e-8 N/(rad/s)^2 |
+| Torque coefficient k_m | 7.24e-10 N m/(rad/s)^2 |
+| Motor time constant | 25 ms |
 | Arm length | 46 mm (35.4 mm to rotor center, X-config) |
 | Max rotor speed | 2315 rad/s |
 | Sim frequency | 100 Hz |
 | Episode length | 10 s (1000 steps) |
 
+These follow the Crazyflie 2.1 parameters used by SimpleFlight. The M1/M2 simulation has no aerodynamic effects, sensor noise, latency or battery model.
+
 ---
 
 ## Papers
 
-- **SimpleFlight** — Chen et al., RAL 2025. arXiv:2412.11764. Source of M1 architecture, hyperparameters, and eval methodology.
-- **RMA** — Kumar et al., RSS 2021. arXiv:2107.04034. Two-phase privileged training used in M2.
-- **MAVEN** — arXiv:2603.10714. Domain randomization ranges for rotor faults and mass variation.
-- **GRaD-Nav++** — Chen et al., RAL 2025. arXiv:2506.14009. Language-commanded flight; target for M5.
-- **PureJaxRL** — Lu et al., 2022. Fully-JIT-compiled PPO training pattern used throughout.
+- **SimpleFlight**: Chen et al., RAL 2025. arXiv:2412.11764. Source of the M1 architecture, hyperparameters and evaluation setup.
+- **RMA**: Kumar et al., RSS 2021. arXiv:2107.04034. Two-phase privileged training used in M2.
+- **MAVEN**: arXiv:2603.10714. Source of the rotor-fault and mass randomization ranges.
+- **PureJaxRL**: Lu et al., 2022. The fully JIT-compiled PPO pattern used throughout.
 
 ---
 
 ## Contact
 
-Olivier Couthaud — olivier.couthaud@gmail.com — [@olivier_couth](https://x.com/olivier_couth)
+Olivier Couthaud, olivier.couthaud@gmail.com, [@olivier_couth](https://x.com/olivier_couth)
 
-If you work on agile drone RL, sim-to-real, 3DGS-SLAM, or vision-language robotics and want to compare notes, I'd like to hear from you.
+If you work on agile drone RL or fault-tolerant control and want to compare notes, I'd like to hear from you.
